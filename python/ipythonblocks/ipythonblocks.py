@@ -9,6 +9,7 @@ practicing control flow stuctures and quickly seeing the results.
 # https://github.com/jiffyclub/ipythonblocks/blob/master/LICENSE.txt
 
 import copy
+import collections
 import itertools
 import numbers
 import os
@@ -17,17 +18,14 @@ import time
 import uuid
 
 from operator import iadd
+from functools import reduce
 
 from IPython.display import HTML, display, clear_output
 
-if sys.version_info[0] >= 3:
-    xrange = range
-    from functools import reduce
-
 __all__ = ('Block', 'BlockGrid', 'Pixel', 'ImageGrid',
-           'InvalidColorSpec', 'show_color', 'embed_colorpicker',
-           'colors', '__version__')
-__version__ = '1.5'
+           'InvalidColorSpec', 'ShapeMismatch', 'show_color',
+           'embed_colorpicker', 'colors', '__version__')
+__version__ = '1.6dev'
 
 _TABLE = ('<style type="text/css">'
           'table.blockgrid {{border: none;}}'
@@ -49,12 +47,18 @@ _DOUBLE_SLICE = 'double slice'
 
 _SMALLEST_BLOCK = 1
 
-_SLEEP_TIME = 0.2
-
 
 class InvalidColorSpec(Exception):
     """
     Error for a color value that is not a number.
+
+    """
+    pass
+
+
+class ShapeMismatch(Exception):
+    """
+    Error for when a grid assigned to another doesn't have the same shape.
 
     """
     pass
@@ -85,6 +89,37 @@ def embed_colorpicker():
     display(HTML(iframe))
 
 
+def _color_property(name):
+    real_name = "_" + name
+
+    @property
+    def prop(self):
+        return getattr(self, real_name)
+
+    @prop.setter
+    def prop(self, value):
+        value = Block._check_value(value)
+        setattr(self, real_name, value)
+
+    return prop
+
+
+def _flatten(thing, ignore_types=(str,)):
+    """
+    Yield a single item or str/unicode or recursively yield from iterables.
+
+    Adapted from Beazley's Python Cookbook.
+
+    """
+    if isinstance(thing, collections.Iterable) and \
+            not isinstance(thing, ignore_types):
+        for i in thing:
+            for x in _flatten(i):
+                yield x
+    else:
+        yield thing
+
+
 class Block(object):
     """
     A colored square.
@@ -112,6 +147,10 @@ class Block(object):
 
     """
 
+    red = _color_property('red')
+    green = _color_property('green')
+    blue = _color_property('blue')
+
     def __init__(self, red, green, blue, size=20):
         self.red = red
         self.green = green
@@ -132,33 +171,6 @@ class Block(object):
             raise InvalidColorSpec(s)
 
         return int(round(min(255, max(0, value))))
-
-    @property
-    def red(self):
-        return self._red
-
-    @red.setter
-    def red(self, value):
-        value = self._check_value(value)
-        self._red = value
-
-    @property
-    def green(self):
-        return self._green
-
-    @green.setter
-    def green(self, value):
-        value = self._check_value(value)
-        self._green = value
-
-    @property
-    def blue(self):
-        return self._blue
-
-    @blue.setter
-    def blue(self, value):
-        value = self._check_value(value)
-        self._blue = value
 
     @property
     def rgb(self):
@@ -202,6 +214,19 @@ class Block(object):
         self.green = green
         self.blue = blue
 
+    def _update(self, other):
+        if isinstance(other, Block):
+            self.rgb = other.rgb
+            self.size = other.size
+        elif isinstance(other, collections.Sequence) and len(other) == 3:
+            self.rgb = other
+        else:
+            errmsg = (
+                'Value must be a Block or a sequence of 3 integers. '
+                'Got {0!r}.'
+            )
+            raise ValueError(errmsg.format(other))
+
     @property
     def _td(self):
         """
@@ -219,6 +244,13 @@ class Block(object):
     def show(self):
         display(HTML(self._repr_html_()))
 
+    __hash__ = None
+
+    def __eq__(self, other):
+        if not isinstance(other, Block):
+            return False
+        return self.rgb == other.rgb and self.size == other.size
+
     def __str__(self):
         s = ['{0}'.format(self.__class__.__name__),
              'Color: ({0}, {1}, {2})'.format(self._red,
@@ -230,6 +262,14 @@ class Block(object):
             s[0] += ' [{0}, {1}]'.format(self._row, self._col)
 
         return os.linesep.join(s)
+
+    def __repr__(self):
+        type_name = type(self).__name__
+        return '{0}({1}, {2}, {3}, size={4})'.format(type_name,
+                                                     self.red,
+                                                     self.green,
+                                                     self.blue,
+                                                     self.size)
 
 
 class BlockGrid(object):
@@ -277,8 +317,8 @@ class BlockGrid(object):
 
     def _initialize_grid(self, fill):
         grid = [[Block(*fill, size=self._block_size)
-                for col in xrange(self.width)]
-                for row in xrange(self.height)]
+                for col in range(self.width)]
+                for row in range(self.height)]
 
         self._grid = grid
 
@@ -317,8 +357,7 @@ class BlockGrid(object):
 
         self._lines_on = value
 
-    @classmethod
-    def _view_from_grid(cls, grid):
+    def _view_from_grid(self, grid):
         """
         Make a new grid from a list of lists of Block objects.
 
@@ -326,7 +365,9 @@ class BlockGrid(object):
         new_width = len(grid[0])
         new_height = len(grid)
 
-        new_BG = cls(new_width, new_height)
+        new_BG = self.__class__(new_width, new_height,
+                                block_size=self._block_size,
+                                lines_on=self._lines_on)
         new_BG._grid = grid
 
         return new_BG
@@ -385,26 +426,23 @@ class BlockGrid(object):
             return self._view_from_grid(new_grid)
 
     def __setitem__(self, index, value):
-        if len(value) != 3:
-            s = 'Assigned value must have three integers. got {0}.'
-            raise ValueError(s.format(value))
+        thing = self[index]
 
-        ind_cat = self._categorize_index(index)
+        if isinstance(value, BlockGrid):
+            if isinstance(thing, BlockGrid):
+                if thing.shape != value.shape:
+                    raise ShapeMismatch('Both sides of grid assignment must '
+                                        'have the same shape.')
 
-        if ind_cat == _SINGLE_ROW:
-            map(lambda b: b.set_colors(*value), self._grid[index])
+                for a, b in zip(thing, value):
+                    a._update(b)
 
-        elif ind_cat == _SINGLE_ITEM:
-            self._grid[index[0]][index[1]].set_colors(*value)
+            else:
+                raise TypeError('Cannot assign grid to single block.')
 
-        else:
-            if ind_cat == _ROW_SLICE:
-                sub_grid = self._grid[index]
-
-            elif ind_cat == _DOUBLE_SLICE:
-                sub_grid = self._get_double_slice(index)
-
-            map(lambda b: b.set_colors(*value), itertools.chain(*sub_grid))
+        elif isinstance(value, (collections.Iterable, Block)):
+            for b in _flatten(thing):
+                b._update(value)
 
     def _get_double_slice(self, index):
         sl_height, sl_width = index
@@ -427,20 +465,24 @@ class BlockGrid(object):
         return grid
 
     def __iter__(self):
-        for r in xrange(self.height):
-            for c in xrange(self.width):
+        for r in range(self.height):
+            for c in range(self.width):
                 yield self[r, c]
 
-    @property
-    def animate(self):
+    def animate(self, stop_time=0.2):
         """
-        Iterate over this property to have your changes to the grid
+        Call this method in a loop definition to have your changes to the grid
         animated in the IPython Notebook.
+
+        Parameters
+        ----------
+        stop_time : float
+            Amount of time to pause between loop steps.
 
         """
         for block in self:
             self.show()
-            time.sleep(_SLEEP_TIME)
+            time.sleep(stop_time)
             yield block
             clear_output()
         self.show()
@@ -477,13 +519,20 @@ class BlockGrid(object):
         """
         display(HTML(self._repr_html_()))
 
-    def flash(self):
+    def flash(self, display_time=0.2):
         """
-        Display the grid for a short time. Useful for making an animation.
+        Display the grid for a time.
+
+        Useful for making an animation or iteratively displaying changes.
+
+        Parameters
+        ----------
+        display_time : float
+            Amount of time, in seconds, to display the grid.
 
         """
         self.show()
-        time.sleep(_SLEEP_TIME)
+        time.sleep(display_time)
         clear_output()
 
     def to_text(self, filename=None):
@@ -611,8 +660,8 @@ class ImageGrid(BlockGrid):
 
     def _initialize_grid(self, fill):
         grid = [[Pixel(*fill, size=self._block_size)
-                for col in xrange(self.width)]
-                for row in xrange(self.height)]
+                for col in range(self.width)]
+                for row in range(self.height)]
 
         self._grid = grid
 
@@ -641,7 +690,10 @@ class ImageGrid(BlockGrid):
         # now take into account that the ImageGrid origin may be lower-left,
         # while the ._grid origin is upper-left.
         if self._origin == 'lower-left':
-            new_ind[0] = self._height - new_ind[0] - 1
+            if new_ind[0] >= 0:
+                new_ind[0] = self._height - new_ind[0] - 1
+            else:
+                new_ind[0] = abs(new_ind[0]) - 1
 
         return tuple(new_ind)
 
@@ -654,6 +706,10 @@ class ImageGrid(BlockGrid):
             raise IndexError(s)
 
         if ind_cat == _SINGLE_ITEM:
+            # should be able to index ._grid with new_ind regardless of any
+            # following coordinate transforms. let's just make sure.
+            self._grid[index[1]][index[0]]
+
             real_index = self._transform_index(index)
             pixel = self._grid[real_index[0]][real_index[1]]
             pixel._col, pixel._row = index
@@ -662,19 +718,6 @@ class ImageGrid(BlockGrid):
         elif ind_cat == _DOUBLE_SLICE:
             new_grid = self._get_double_slice(index)
             return self._view_from_grid(new_grid)
-
-    def __setitem__(self, index, value):
-        if len(value) != 3:
-            s = 'Assigned value must have three integers. got {0}.'
-            raise ValueError(s.format(value))
-
-        pixels = self[index]
-
-        if isinstance(pixels, Pixel):
-            pixels.set_colors(*value)
-
-        else:
-            map(lambda p: p.set_colors(*value), itertools.chain(*pixels._grid))
 
     def _get_double_slice(self, index):
         cslice, rslice = index
@@ -702,8 +745,8 @@ class ImageGrid(BlockGrid):
         return new_grid
 
     def __iter__(self):
-        for col in xrange(self.width):
-            for row in xrange(self.height):
+        for col in range(self.width):
+            for row in range(self.height):
                 yield self[col, row]
 
     def _repr_html_(self):
